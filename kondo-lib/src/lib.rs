@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::HashSet,
     error::{self, Error},
     fs,
     path::{self, Path},
@@ -360,6 +361,10 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
 
 struct ProjectIter {
     it: walkdir::IntoIter,
+    nested: bool,
+    // Artifact directories of the projects found so far, in nested mode. They
+    // are never entered: node_modules alone holds a package.json per dependency.
+    artifact_dirs: HashSet<path::PathBuf>,
 }
 
 pub enum Red {
@@ -381,6 +386,10 @@ impl Iterator for ProjectIter {
                 continue;
             }
             if is_hidden(&entry) {
+                self.it.skip_current_dir();
+                continue;
+            }
+            if self.nested && self.artifact_dirs.remove(entry.path()) {
                 self.it.skip_current_dir();
                 continue;
             }
@@ -444,11 +453,21 @@ impl Iterator for ProjectIter {
                     _ => None,
                 };
                 if let Some(project_type) = p_type {
-                    self.it.skip_current_dir();
-                    return Some(Ok(Project {
+                    let project = Project {
                         project_type,
                         path: entry.path().to_path_buf(),
-                    }));
+                    };
+                    if self.nested {
+                        self.artifact_dirs.extend(
+                            project
+                                .artifact_dirs()
+                                .iter()
+                                .map(|artifact_dir| project.path.join(artifact_dir)),
+                        );
+                    } else {
+                        self.it.skip_current_dir();
+                    }
+                    return Some(Ok(project));
                 }
             }
         }
@@ -483,6 +502,9 @@ fn is_react_native_project(path: &Path) -> bool {
 pub struct ScanOptions {
     pub follow_symlinks: bool,
     pub same_file_system: bool,
+    /// Keep looking for projects inside the projects found, skipping only
+    /// their artifact directories.
+    pub nested: bool,
 }
 
 fn build_walkdir_iter<P: AsRef<path::Path>>(path: &P, options: &ScanOptions) -> ProjectIter {
@@ -491,6 +513,8 @@ fn build_walkdir_iter<P: AsRef<path::Path>>(path: &P, options: &ScanOptions) -> 
             .follow_links(options.follow_symlinks)
             .same_file_system(options.same_file_system)
             .into_iter(),
+        nested: options.nested,
+        artifact_dirs: HashSet::new(),
     }
 }
 
@@ -596,7 +620,50 @@ pub fn path_canonicalise(
 
 #[cfg(test)]
 mod tests {
-    use super::print_elapsed;
+    use super::{print_elapsed, scan, ScanOptions};
+    use std::{fs, path::PathBuf};
+
+    fn found_projects(root: &PathBuf, nested: bool) -> Vec<PathBuf> {
+        let options = ScanOptions {
+            follow_symlinks: false,
+            same_file_system: true,
+            nested,
+        };
+        let mut paths: Vec<PathBuf> = scan(root, &options)
+            .filter_map(|project| project.ok())
+            .map(|project| project.path.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn nested_projects() {
+        let root = std::env::temp_dir().join(format!("kondo-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for (dir, marker) in [
+            ("", "Cargo.toml"),
+            ("target/debug/build/dep", "Cargo.toml"),
+            ("examples/demo", "Cargo.toml"),
+            ("web", "package.json"),
+            ("web/node_modules/dep", "package.json"),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join(marker), "").unwrap();
+        }
+
+        assert_eq!(found_projects(&root, false), vec![PathBuf::new()]);
+        assert_eq!(
+            found_projects(&root, true),
+            vec![
+                PathBuf::new(),
+                PathBuf::from("examples/demo"),
+                PathBuf::from("web")
+            ]
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn elapsed() {
